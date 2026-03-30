@@ -1,0 +1,90 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: spark-lab-postgres
+    environment:
+      POSTGRES_DB: spark_lab
+      POSTGRES_USER: spark
+      POSTGRES_PASSWORD: spark123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./data:/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    networks:
+      - spark-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spark -d spark_lab"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  spark-master:
+    build:
+      context: .
+      dockerfile: spark.Dockerfile
+    container_name: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    volumes:
+      - ./spark-jobs:/opt/spark-jobs
+      - ./data:/opt/spark-data
+    networks:
+      - spark-network
+
+  spark-worker:
+    build:
+      context: .
+      dockerfile: spark.Dockerfile
+    container_name: spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=2
+    depends_on:
+      - spark-master
+    networks:
+      - spark-network
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: spark-lab-clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse-config/users.xml:/etc/clickhouse-server/users.d/spark.xml
+    networks:
+      - spark-network
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  jupyter:
+    image: jupyter/pyspark-notebook:latest
+    container_name: spark-lab-jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - PYSPARK_SUBMIT_ARGS=--master spark://spark-master:7077 pyspark-shell
+    volumes:
+      - ./spark-jobs:/home/jovyan/work
+      - ./data:/home/jovyan/data
+    networks:
+      - spark-network
+    depends_on:
+      - spark-master
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+
+networks:
+  spark-network:
+    driver: bridge
