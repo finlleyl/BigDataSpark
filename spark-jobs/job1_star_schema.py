@@ -1,6 +1,5 @@
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.window import Window
 
 POSTGRES_URL = "jdbc:postgresql://postgres:5432/spark_lab"
 POSTGRES_PROPS = {
@@ -15,6 +14,9 @@ def create_spark_session():
         SparkSession.builder
         .appName("Job1_StarSchema")
         .config("spark.jars", "/opt/spark/jars-extra/postgresql-42.7.3.jar")
+        .config("spark.executor.memory", "1g")
+        .config("spark.driver.memory", "1g")
+        .config("spark.executor.cores", "2")
         .getOrCreate()
     )
 
@@ -29,7 +31,7 @@ def read_raw_data(spark):
 
 
 def build_dim_customer(raw_df):
-    dim = (
+    return (
         raw_df
         .select(
             F.col("sale_customer_id").alias("customer_id"),
@@ -46,11 +48,10 @@ def build_dim_customer(raw_df):
         .dropDuplicates(["customer_id"])
         .orderBy("customer_id")
     )
-    return dim
 
 
 def build_dim_seller(raw_df):
-    dim = (
+    return (
         raw_df
         .select(
             F.col("sale_seller_id").alias("seller_id"),
@@ -63,11 +64,10 @@ def build_dim_seller(raw_df):
         .dropDuplicates(["seller_id"])
         .orderBy("seller_id")
     )
-    return dim
 
 
 def build_dim_product(raw_df):
-    dim = (
+    return (
         raw_df
         .select(
             F.col("sale_product_id").alias("product_id"),
@@ -90,7 +90,6 @@ def build_dim_product(raw_df):
         .dropDuplicates(["product_id"])
         .orderBy("product_id")
     )
-    return dim
 
 
 def build_dim_store(raw_df):
@@ -107,13 +106,11 @@ def build_dim_store(raw_df):
         )
         .dropDuplicates(["store_name", "store_city"])
     )
-    w = Window.orderBy("store_name", "store_city")
-    dim = dim.withColumn("store_id", F.row_number().over(w))
-    dim = dim.select(
+    dim = dim.withColumn("store_id", F.monotonically_increasing_id())
+    return dim.select(
         "store_id", "store_name", "store_location", "store_city",
         "store_state", "store_country", "store_phone", "store_email"
     )
-    return dim
 
 
 def build_dim_supplier(raw_df):
@@ -130,43 +127,14 @@ def build_dim_supplier(raw_df):
         )
         .dropDuplicates(["supplier_name", "supplier_email"])
     )
-    w = Window.orderBy("supplier_name")
-    dim = dim.withColumn("supplier_id", F.row_number().over(w))
-    dim = dim.select(
+    dim = dim.withColumn("supplier_id", F.monotonically_increasing_id())
+    return dim.select(
         "supplier_id", "supplier_name", "supplier_contact", "supplier_email",
         "supplier_phone", "supplier_address", "supplier_city", "supplier_country"
     )
-    return dim
 
 
-def build_dim_time(raw_df):
-    dates = (
-        raw_df
-        .select("sale_date")
-        .dropDuplicates()
-        .withColumn("parsed_date", F.to_date("sale_date", "M/d/yyyy"))
-        .filter(F.col("parsed_date").isNotNull())
-    )
-    dim = (
-        dates
-        .withColumn("year", F.year("parsed_date"))
-        .withColumn("month", F.month("parsed_date"))
-        .withColumn("day", F.dayofmonth("parsed_date"))
-        .withColumn("quarter", F.quarter("parsed_date"))
-        .withColumn("day_of_week", F.dayofweek("parsed_date"))
-        .withColumn("month_name", F.date_format("parsed_date", "MMMM"))
-    )
-    w = Window.orderBy("parsed_date")
-    dim = dim.withColumn("time_id", F.row_number().over(w))
-    dim = dim.select(
-        "time_id", F.col("parsed_date").alias("full_date"),
-        "year", "month", "day", "quarter", "day_of_week", "month_name",
-        "sale_date"
-    )
-    return dim
-
-
-def build_fact_sales(raw_df, dim_store, dim_supplier, dim_time):
+def build_fact_sales(raw_df, dim_store, dim_supplier):
     store_lookup = dim_store.select(
         F.col("store_id"),
         F.col("store_name").alias("s_name"),
@@ -176,10 +144,6 @@ def build_fact_sales(raw_df, dim_store, dim_supplier, dim_time):
         F.col("supplier_id"),
         F.col("supplier_name").alias("sup_name"),
         F.col("supplier_email").alias("sup_email")
-    )
-    time_lookup = dim_time.select(
-        F.col("time_id"),
-        F.col("sale_date").alias("t_sale_date")
     )
 
     fact = (
@@ -192,9 +156,6 @@ def build_fact_sales(raw_df, dim_store, dim_supplier, dim_time):
               (raw_df.supplier_name == supplier_lookup.sup_name) &
               (raw_df.supplier_email == supplier_lookup.sup_email),
               "left")
-        .join(time_lookup,
-              raw_df.sale_date == time_lookup.t_sale_date,
-              "left")
         .select(
             F.col("id").alias("sale_id"),
             F.col("sale_customer_id").alias("customer_id"),
@@ -202,7 +163,6 @@ def build_fact_sales(raw_df, dim_store, dim_supplier, dim_time):
             F.col("sale_product_id").alias("product_id"),
             F.col("store_id"),
             F.col("supplier_id"),
-            F.col("time_id"),
             F.col("sale_quantity"),
             F.col("sale_total_price"),
             F.to_date("sale_date", "M/d/yyyy").alias("sale_date")
@@ -223,23 +183,21 @@ def main():
     spark = create_spark_session()
 
     raw_df = read_raw_data(spark)
-    raw_df.cache()  # будем обращаться многократно
+    raw_df.cache()
 
     dim_customer = build_dim_customer(raw_df)
     dim_seller = build_dim_seller(raw_df)
     dim_product = build_dim_product(raw_df)
     dim_store = build_dim_store(raw_df)
     dim_supplier = build_dim_supplier(raw_df)
-    dim_time = build_dim_time(raw_df)
 
-    fact_sales = build_fact_sales(raw_df, dim_store, dim_supplier, dim_time)
+    fact_sales = build_fact_sales(raw_df, dim_store, dim_supplier)
 
     write_to_postgres(dim_customer, "dim_customer")
     write_to_postgres(dim_seller, "dim_seller")
     write_to_postgres(dim_product, "dim_product")
     write_to_postgres(dim_store, "dim_store")
     write_to_postgres(dim_supplier, "dim_supplier")
-    write_to_postgres(dim_time, "dim_time")
     write_to_postgres(fact_sales, "fact_sales")
 
     spark.stop()
